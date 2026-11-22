@@ -1,0 +1,249 @@
+HYPERDROP — INTEGRATION / SECURITY / BUILD NOTES
+================================================
+
+Status and honest limits
+------------------------
+This source bundle is an implementation template, not a certified or fully device-tested release.
+A Kotlin/Android Gradle build and two-phone radio test have NOT been run in this environment:
+there is no Android SDK/Gradle installation here. Do not treat the static audit as proof of a
+successful APK build or as a security certification.
+
+The two supplied MP4 clips were used as visual direction for a dark, centered, luminous sharing
+portal and a clean, screen-based transfer experience. The implementation uses touch/tap only.
+It does not use a camera, camera permission, face/hand tracking, or gesture-recognition ML.
+
+1. Visual / animation design
+----------------------------
+* Main surface is a full-screen Compose Canvas with no permanent labels or buttons.
+* The sender press/outgoing state draws an inward particle convergence and compressed core glow.
+* Incoming transfer grows a central portal with live progress/speed-dependent light intensity.
+* Verifying, connecting, success, and error use distinct palette/motion states. Native Android
+  dialogs remain available for authentication digits and installer approval; these are intentional
+  security confirmations, not permanent controls on the main screen.
+* The spring equation is the under-damped second-order system:
+      x'' + 2*zeta*sqrt(k)*x' + k*(x-target) = 0
+  with k=380 and zeta=0.82 for the portal. zeta=0.82 is slightly under-damped; mathematically
+  critical damping is zeta=1.0. The implementation uses the closed-form under-damped solution
+  with frame delta-time, not a fixed number of animation steps. Delta time is clamped after a long
+  frame gap. The suction field uses the same analytic approach with k=250, zeta=0.88.
+* Animated state is read in the Canvas draw phase. Gradient stop lists and Brush instances are
+  remembered by the discrete phase palette rather than recreated as color lists each frame.
+  This reduces composition work and temporary allocations; it does not promise literally zero
+  allocations inside Compose/Skia's renderer.
+* The canvas does not use Android RuntimeShader/AGSL. Therefore there is no API-33-only AGSL
+  dependency or AGSL version guard in this implementation. It uses Compose Canvas APIs available
+  at minSdk 31.
+
+2. Nearby transport and speed trade-offs
+----------------------------------------
+* Strategy: P2P_POINT_TO_POINT. Advertising/discovery use low-power mode false; connection options
+  use low-power false and ConnectionType.DISRUPTIVE.
+* Nearby Connections selects the radio path supported by both phones and the environment. The
+  application cannot guarantee that each link will be Wi-Fi Direct or Wi-Fi LAN. DISRUPTIVE can let
+  Nearby change Wi-Fi/Bluetooth state for a faster P2P link and can interrupt the phone's existing
+  Wi-Fi internet connection. The app does not promise uninterrupted internet access during a
+  high-throughput session.
+* Up to three outgoing encrypted file payloads are prepared/transferred concurrently; additional
+  items stay queued. Actual throughput still depends on phone hardware, radio conditions, Nearby,
+  file provider speed, encryption CPU performance, and thermal state.
+* The encrypted temporary file is opened as a ParcelFileDescriptor and sent with
+  `Payload.fromFile(ParcelFileDescriptor)`, which is the Nearby `FILE` payload factory. Do not
+  replace it with `Payload.fromStream(ParcelFileDescriptor)`: that creates a different `STREAM`
+  payload type and would require a matching receiver path. The `fromFile(PFD)` overload is present
+  in the Google Play services Nearby API reference.
+* Progress publication is throttled to approximately 15 updates/second. The UI uses this measured
+  speed only as glow intensity; it does not display a speed number.
+* Both the original file and the encrypted output cannot be zero-copy at the same time if the app
+  must encrypt each chunk itself. The sender reads the selected source and writes an encrypted
+  temporary file, then passes a ParcelFileDescriptor for that encrypted file to Nearby. The
+  receiver decrypts authenticated frames into private quarantine and copies a verified file into
+  Downloads/HyperDrop. This adds local disk I/O and temporary storage use, but enables per-frame
+  AEAD authentication and quarantine-before-publish. Pipe-backed source URIs may also require a
+  source staging copy. This is the deliberate security/performance trade-off.
+
+3. Cryptographic protocol (what the code actually does)
+-------------------------------------------------------
+Connection / user confirmation:
+1. Each connection uses a random 32-byte (256-bit) local nonce and a per-session P-256 EC key pair.
+   The private key is generated in AndroidKeyStore with PURPOSE_AGREE_KEY. Only its public key is
+   sent to the other endpoint.
+2. Each phone displays Nearby's authentication digits in a native confirmation dialog. Both users
+   must independently verify that the digits shown on their own phones match and explicitly accept.
+   A mismatch, cancel, second pending connection, 30-second verification timeout, or 30-second
+   session-handshake timeout rejects/ends the attempt.
+3. The two peers exchange versioned HELLO/AUTH control messages over the Nearby connection. The
+   authenticated transcript includes both ordered 256-bit nonces, both encoded P-256 public keys,
+   and the Nearby authentication digits. Duplicate/changed session HELLO material is rejected.
+4. ECDH P-256 derives a shared secret. HKDF-SHA-256 (RFC 5869) derives two directional 256-bit
+   session keys. Each side sends an HMAC-SHA-256 proof over the session transcript; the opposite
+   directional key is used for constant-time proof verification. The file-transfer keys are not
+   used until the proof succeeds.
+
+Hardware-backing behavior:
+* After generating the key, the app queries KeyInfo.getSecurityLevel() (API 31+) and accepts only
+  TRUSTED_ENVIRONMENT (TEE) or STRONGBOX. A device that reports SOFTWARE/unknown or cannot perform
+  P-256 agreement in a supported secure hardware level fails closed rather than silently claiming
+  hardware backing.
+* AndroidKeyStore keeps the ECDH private key material in secure hardware when that security level
+  is reported. This does NOT prove a Samsung Knox certification, does not mean the whole app runs
+  in a secure enclave, and does not make a phone unbreakable. Device implementations differ; some
+  phones may not support hardware-backed P-256 ECDH and therefore will not connect using this build.
+* The shared secret and derived working keys are briefly present in app process memory for HKDF,
+  HMAC and AES-GCM operations. The AndroidKeyStore protects the ECDH private key; it does not
+  automatically make the derived per-transfer AES key hardware-backed. Arrays are zeroed after use
+  where the runtime permits, but managed-runtime memory wiping is best effort, not a formal proof
+  that no copies ever existed.
+
+Per-file and per-frame encryption:
+1. HKDF-SHA-256 derives a separate 32-byte AES key for each random transfer token and direction.
+2. Each file is split into 256 KiB plaintext frames. AES-256-GCM with a 128-bit authentication tag
+   protects each frame.
+3. The 96-bit GCM nonce is a per-file random 64-bit prefix followed by a 32-bit monotonically
+   increasing frame counter. The code rejects counter gaps, duplicates, reordering, impossible
+   lengths, unexpected frame counts and trailing bytes.
+4. AAD binds the session sender/recipient nonces, transfer token, frame counter, declared total
+   plaintext size and expected SHA-256. A frame must pass GCM authentication before its plaintext
+   is written to the private quarantine.
+5. The receiver checks the exact total plaintext byte count and whole-file SHA-256, then copies the
+   verified file to Downloads/HyperDrop. The copy is checked again for exact length and SHA-256
+   before the MediaStore item is made visible (IS_PENDING=0). Legacy Downloads output is also
+   checked before the media scanner is notified.
+6. Incoming files are kept in app-private no-backup quarantine while encrypted frames are checked.
+   Failed, incomplete, rejected, timed-out or cancelled quarantines and Nearby temporary copies are
+   deleted on a best-effort basis.
+
+Installer handling / threat model:
+* APK/APKS/XAPK/APKM/AAB names and known installer/archive MIME types/extensions/signatures are
+  routed to a native Save/Discard confirmation. Archives are not extracted, executed or opened.
+  Nothing received is auto-opened. User approval is required before an installer is saved to public
+  Downloads. The warning is not malware scanning.
+* SHA-256 proves that received bytes match the digest sent by the peer; because the sender supplies
+  that digest, SHA-256 alone does not establish that the sender is trustworthy.
+* AEAD, the ECDH/HKDF/HMAC handshake, the Nearby encrypted connection and both users comparing the
+  Nearby digits provide confidentiality/integrity and connection authentication for the transfer.
+  The digit comparison is an out-of-band user check; it is not a password-authenticated key exchange
+  (PAKE), not a certificate system, and not a guarantee against a compromised endpoint.
+* This pipeline does not scan for viruses, trojans, malicious documents, harmful macros, or unsafe
+  links. A malicious sender can deliberately send malicious but cryptographically valid content.
+  Do not install or open unexpected files. Users remain responsible for deciding whether to keep
+  or open a received file using Android's normal app/file-manager flow.
+* Rooted/compromised devices, a malicious OS or Google Play services implementation, a compromised
+  app process, malicious content supplied by a trusted peer, and physical compromise of either
+  endpoint are outside the protection this app can guarantee. No "unbypassable" or "Knox-grade"
+  claim is made.
+
+4. Metadata, lifecycle and permission boundaries
+-------------------------------------------------
+* Incoming file count, per-file size, total session size, payload IDs, transfer tokens, nonce
+  formats, MIME syntax, filenames and wire-size calculations are checked before acceptance.
+* Names are stripped of path separators, control characters, traversal markers and leading/trailing
+  dots, then limited to a fixed length. Destination is Downloads/HyperDrop or private quarantine;
+  received paths are never used as filesystem paths.
+* P2P advertising/discovery starts only while the Activity is foregrounded and the screen is
+  interactive. It stops on Activity onStop/screen-off and after the idle timeout. A subsequent
+  foreground interaction can restart discovery.
+* The ViewModel releases the Wi-Fi performance lock at transfer end, failure, stop and clear.
+  FLAG_KEEP_SCREEN_ON is scoped to active transfers; it is not a background service.
+* Nearby manager work runs in an IO SupervisorJob scope. A generation token invalidates stale
+  callbacks/work; reset closes payloads and removes quarantines/temp files. ViewModel.onCleared
+  calls release() to cancel its manager scope.
+* The app does not declare INTERNET. This prevents the app package from requesting general
+  internet access; it does not mean Google Play services itself never uses network access for its
+  own service operations. Nearby peer payloads use the local Nearby connection.
+
+Permission matrix (minSdk 31, targetSdk 37):
+* Android 12 / 12L (API 31-32): BLUETOOTH_SCAN/CONNECT/ADVERTISE plus Nearby's documented
+  ACCESS_COARSE_LOCATION, ACCESS_FINE_LOCATION and READ_EXTERNAL_STORAGE compatibility permissions.
+  The latter three are capped at API 32 and requested only on API 31-32.
+* Android 13-16 (API 33-36): BLUETOOTH_SCAN/CONNECT/ADVERTISE and NEARBY_WIFI_DEVICES. No location
+  or legacy storage permission is declared/requested for these versions.
+* Android 17+ (API 37+ target): add/request ACCESS_LOCAL_NETWORK when Nearby may use WIFI_LAN.
+* ACCESS_WIFI_STATE and CHANGE_WIFI_STATE are declared only through API 32 per the current Nearby
+  guide; WAKE_LOCK is used for the short-lived Wi-Fi performance lock.
+* The manifest removes INTERNET from the merged manifest, sets allowBackup=false and
+  usesCleartextTraffic=false, and exports only MainActivity. Review the final merged manifest after
+  adding any further dependency. Android Gradle/manifest merging can otherwise add permissions.
+
+5. Pre-build audit / prioritized findings
+-----------------------------------------
+P0 — compile blocker fixed:
+* NearbyManager.kt contained duplicate insertWithMediaStore() and writeLegacyDownloads()
+  declarations. The duplicate block has been removed.
+
+P1 — permission and device compatibility fixed/documented:
+* Nearby's FILE payload path needs READ_EXTERNAL_STORAGE compatibility permission through API 32;
+  runtime request is now present. The current Nearby permission guide also lists coarse/fine location
+  through API 32, now capped and requested only on those API levels.
+* NEARBY_WIFI_DEVICES is declared/requested from API 33. ACCESS_LOCAL_NETWORK is declared/requested
+  only for API 37+ targets.
+* KeyInfo.isInsideSecureHardware was deprecated at API 31. Code now uses getSecurityLevel() and
+  refuses to downgrade to software ECDH. minSdk is 31 because this implementation requires API 31
+  KeyInfo security levels / AndroidKeyStore ECDH.
+* Removed android:fullBackupContent="false"; allowBackup=false is the intended switch and avoids a
+  resource-reference ambiguity.
+
+P2 — rendering / release hardening improved:
+* Canvas animation reads are kept in the draw phase rather than the composable body. Palette stop
+  lists and Brush instances are remembered across frames. Spring motion uses a closed-form damped
+  oscillator with elapsed frame time.
+* R8 keeps the single AndroidViewModel constructor used by the default factory; no broad package
+  keep rule is added.
+* This renderer uses Canvas, not AGSL/RuntimeShader, so no Android 13 AGSL guard is required.
+* The app uses a scoped ViewModel/manager lifecycle. Test cancellation while encrypting, receiving,
+  copying to Downloads, and while installer confirmation is pending; verify all temp files are gone.
+
+6. Gradle / build setup
+-----------------------
+Included:
+* settings.gradle.kts
+* root build.gradle.kts
+* gradle/libs.versions.toml
+* gradle.properties
+* gradle/wrapper/gradle-wrapper.properties
+* app/build.gradle.kts
+* app/proguard-rules.pro
+
+Locked toolchain:
+* Android Gradle Plugin 9.1.1
+* Gradle 9.3.1
+* JDK 17
+* Android SDK Platform 37 / compileSdk 37 / targetSdk 37
+* Kotlin toolchain supplied by AGP 9.1.1 (KGP 2.2.10); Compose compiler plugin 2.2.10
+* Compose BOM 2026.09.00
+* Play Services Nearby 19.5.0
+* AndroidX Activity 1.13.0, Core KTX 1.19.1, Annotation 1.10.0, Lifecycle 2.11.1
+* kotlinx-coroutines-android 1.11.0
+
+Important AGP 9 note:
+* AGP 9.1.1 has built-in Kotlin support. Do NOT also apply the legacy
+  org.jetbrains.kotlin.android plugin. The Compose compiler plugin remains separate and is applied
+  as org.jetbrains.kotlin.plugin.compose at the matching Kotlin version.
+
+Build checklist:
+1. Install JDK 17 and Android SDK Platform 37 / Build Tools 36.0.0.
+2. Keep/restore the Gradle wrapper scripts and wrapper JAR from a normal Gradle 9.3.1 wrapper
+   (this source bundle includes wrapper properties only; it does not fabricate a wrapper JAR).
+3. If replacing existing Gradle files, back up the old ones first. Use the included settings,
+   version catalog, root build file and app build file as one consistent set. Remove any duplicate
+   legacy Kotlin Android plugin declaration.
+4. Ensure the existing app source path is app/src/main/java/com/hyperdrop/app and package names
+   match com.hyperdrop.app / com.hyperdrop.app.nearby.
+5. Run:
+      ./gradlew clean assembleDebug
+      ./gradlew assembleRelease
+6. Install debug on two real Android phones. Test API 31/32 permission prompts, API 33+ Nearby
+   permission prompts, API 37 ACCESS_LOCAL_NETWORK, digit mismatch/timeout, incoming collision,
+   cancel during every transfer stage, duplicate filenames, insufficient storage, installer
+   warning reject/accept, corrupted/truncated frame rejection, and large-file checks.
+7. Test minified release separately. Verify no unexpected permissions in the merged manifest and
+   verify Downloads/HyperDrop output on each Android version.
+
+This bundle has not been built or run on physical devices here. A successful Gradle build and
+two-phone test are required before production use.
+
+
+Wrapper note:
+* This bundle includes gradle/wrapper/gradle-wrapper.properties but intentionally does not include
+  generated wrapper scripts or gradle-wrapper.jar. Create a standard Gradle wrapper from an
+  installed Gradle 9.3.1 distribution (or add the wrapper files from the Android Studio project).
+  Do not hand-create a placeholder gradle-wrapper.jar.

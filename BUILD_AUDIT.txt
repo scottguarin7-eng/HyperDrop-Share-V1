@@ -1,0 +1,41 @@
+HYPERDROP — PRE-BUILD AUDIT SUMMARY
+===================================
+
+Priority / finding / action
+---------------------------
+P0 (fixed)
+- Duplicate NearbyManager.insertWithMediaStore() and writeLegacyDownloads() declarations.
+  Removed the second duplicate block.
+
+P1 (fixed)
+- Nearby FILE payloads need legacy READ_EXTERNAL_STORAGE compatibility permission through API 32.
+  Added manifest declaration and runtime request.
+- Nearby's current permission matrix lists ACCESS_COARSE_LOCATION and ACCESS_FINE_LOCATION through
+  API 32. Added maxSdkVersion=32 declarations and requests only on API 31-32.
+- Added/retained NEARBY_WIFI_DEVICES API 33+ and ACCESS_LOCAL_NETWORK API 37+ manifest and runtime
+  handling.
+- Replaced deprecated KeyInfo.isInsideSecureHardware query with KeyInfo.securityLevel. Accept only
+  TRUSTED_ENVIRONMENT or STRONGBOX; otherwise fail closed.
+- Removed android:fullBackupContent="false"; allowBackup=false remains enabled.
+
+P2 (improved)
+- Canvas animation reads are in the draw phase, cached palette/brush objects avoid rebuilding
+  gradient stop collections each frame, and spring integration uses a closed-form damped solution.
+- R8 keeps the AndroidViewModel constructor required by the default factory only.
+- No AGSL/RuntimeShader is used; Compose Canvas supports the configured minSdk 31.
+
+P2 (requires on-device confirmation)
+- Permission denial/revocation must be exercised on API 31/32, 33-36, and 37+.
+- Test coroutine cancellation and temporary-file cleanup during every IO stage.
+- Test hardware-backed ECDH on target phones. Unsupported hardware security level fails closed.
+- Verify final merged manifest contains no INTERNET permission and only MainActivity is exported.
+- Build and test minified release; static review cannot prove runtime reflection compatibility.
+
+Gradle template
+---------------
+See settings.gradle.kts, build.gradle.kts, gradle/libs.versions.toml,
+gradle/wrapper/gradle-wrapper.properties and app/build.gradle.kts.
+
+Toolchain: AGP 9.1.1 / Gradle 9.3.1 / JDK 17 / compileSdk 37 / minSdk 31 / targetSdk 37.
+Kotlin 2.2.10 is supplied by AGP built-in Kotlin support; apply the separate Compose plugin
+org.jetbrains.kotlin.plugin.compose 2.2.10. Do not also apply org.jetbrains.kotlin.android.

@@ -1,0 +1,21 @@
+RELEASE R8 / RESOURCE SHRINKING CONFIGURATION
+=============================================
+
+The supplied app/build.gradle.kts already applies this to the release variant:
+
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+        proguardFiles(
+            getDefaultProguardFile("proguard-android-optimize.txt"),
+            "proguard-rules.pro"
+        )
+    }
+
+Do not add a second buildTypes block. Keep app/proguard-rules.pro attached to the release
+variant. The supplied rule keeps only the AndroidViewModel constructor used by the default
+ViewModel factory. Nearby and AndroidX artifacts contribute their own consumer rules.
+
+If merging into an existing app, keep exactly one release block and merge the three properties.
+Build and test both debug and minified release variants. Do not add broad -keep rules unless a
+specific reflection/JNI/serialization path is demonstrated by a failing release build.
